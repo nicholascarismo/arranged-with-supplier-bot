@@ -511,7 +511,7 @@ async function arrangeOne(orderName, supplierToAdd) {
   const todayStr = formatMDY(new Date());
   const orderDateStr = formatMDY(orderCreated);
 
-  const headerLine = `Update ${todayStr}: Arranged with ${supplierToAdd} on ${orderDateStr}`;
+  const headerLine = `Update ${todayStr}: Arranged with ${supplierToAdd}`;
   const dashLine = '————————————';
   const newNote = `${headerLine}\n${dashLine}\n${existingNote || ''}`;
 
