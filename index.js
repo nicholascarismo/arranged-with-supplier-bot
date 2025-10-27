@@ -4,178 +4,86 @@ import fsp from 'fs/promises';
 import path from 'path';
 import boltPkg from '@slack/bolt';
 
-/* =========================
-   Slack (Socket Mode)
-========================= */
 const { App } = boltPkg;
 
 /* =========================
    Env & Config
 ========================= */
 const {
-  // Slack
   SLACK_BOT_TOKEN,
   SLACK_APP_TOKEN,
   SLACK_SIGNING_SECRET,
 
-  // Where to post notifications by default
-  WATCH_CHANNEL_ID,
-
-  // Shopify Admin
-  SHOPIFY_DOMAIN,                 // e.g. mystore.myshopify.com
-  SHOPIFY_ADMIN_TOKEN,            // Admin API access token (private app or custom app)
+  SHOPIFY_DOMAIN,
+  SHOPIFY_ADMIN_TOKEN,
   SHOPIFY_API_VERSION = '2025-01',
 
-  // Microsoft Entra App (client credentials for Microsoft Graph)
-  MS_TENANT_ID,
-  MS_CLIENT_ID,
-  MS_CLIENT_SECRET,
-
-  // Polling interval (ms)
-  SCAN_INTERVAL_MS = '60000'      // default: 60s
+  WATCH_CHANNEL_ID
 } = process.env;
 
-// Hard validation (fail fast)
-function need(keys) {
-  const missing = keys.filter(k => !process.env[k] || String(process.env[k]).trim() === '');
-  if (missing.length) {
-    console.error('Missing required env:', missing.join(', '));
+function mustHave(varName) {
+  if (!process.env[varName]) {
+    console.error(`Missing required env: ${varName}`);
     process.exit(1);
   }
 }
-need(['SLACK_BOT_TOKEN', 'SLACK_APP_TOKEN', 'SHOPIFY_DOMAIN', 'SHOPIFY_ADMIN_TOKEN', 'MS_TENANT_ID', 'MS_CLIENT_ID', 'MS_CLIENT_SECRET']);
+mustHave('SLACK_BOT_TOKEN');
+mustHave('SLACK_APP_TOKEN');
+mustHave('SHOPIFY_DOMAIN');
+mustHave('SHOPIFY_ADMIN_TOKEN');
 
 /* =========================
-   Persistent Store (./data)
+   Paths & Persistence
 ========================= */
 const DATA_DIR = path.resolve('./data');
-const SEEN_DIR = path.join(DATA_DIR, 'seen');
-await fsp.mkdir(DATA_DIR, { recursive: true });
-await fsp.mkdir(SEEN_DIR, { recursive: true });
+const RUN_LOG = path.join(DATA_DIR, 'runs.json');
+const SUPPLIERS_FILE = path.resolve('./suppliers.json');
 
-async function readJsonSafe(file, fallback) {
+async function ensureDataDir() {
+  await fsp.mkdir(DATA_DIR, { recursive: true });
+}
+
+async function writeJsonAtomic(filePath, data) {
+  const tmp = `${filePath}.tmp-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  await fsp.writeFile(tmp, JSON.stringify(data, null, 2), 'utf8');
+  await fsp.rename(tmp, filePath);
+}
+
+async function readJsonSafe(filePath, fallback = null) {
   try {
-    const txt = await fsp.readFile(file, 'utf8');
+    const txt = await fsp.readFile(filePath, 'utf8');
     return JSON.parse(txt);
   } catch {
     return fallback;
   }
 }
-async function writeJsonAtomic(file, data) {
-  const tmp = `${file}.tmp-${Date.now()}-${Math.random().toString(36).slice(2)}`;
-  await fsp.writeFile(tmp, JSON.stringify(data, null, 2), 'utf8');
-  await fsp.rename(tmp, file);
-}
 
 /* =========================
-   Supplier Docs (config)
+   Suppliers loader
 ========================= */
-// Each entry defines: a unique key, human name, sharing URL for the Excel file,
-// worksheet name, columns to monitor, and the supplier label to apply in Shopify.
-const SUPPLIER_DOCS = [
-  {
-    key: 'ohc',
-    name: 'Carismo OHC Order Tracking',
-    shareUrl: "https://onedrive.live.com/edit.aspx?resid=F03B2DE5BE400EF9!12376&ithint=file%2Cxlsx&authkey=!AEpFUwfpUgvwGGM&activeCell=%27Customer%20Orders%27!A1",
-    sheet: 'Customer Orders',
-    colOrder: 'B',
-    colDate: 'A',
-    supplier: 'OHC'
-  },
-  {
-    key: 'bospeed',
-    name: 'Carismo Bospeed Order Tracking',
-    shareUrl: "https://onedrive.live.com/edit.aspx?resid=F03B2DE5BE400EF9!12635&cid=f03b2de5be400ef9&CT=1720193149957&OR=ItemsView",
-    sheet: 'Customer Orders',
-    colOrder: 'B',
-    colDate: 'A',
-    supplier: 'Bospeed'
-  },
-  {
-    key: 'tdd',
-    name: 'Carismo TDD Order Tracking',
-    shareUrl: "https://onedrive.live.com/personal/f03b2de5be400ef9/_layouts/15/doc2.aspx?resid=F03B2DE5BE400EF9!sd9a8fda925724253b1a4d60fa15fcd7c&cid=f03b2de5be400ef9&migratedtospo=true&app=Excel",
-    sheet: 'Customer Orders',
-    colOrder: 'B',
-    colDate: 'A',
-    supplier: 'TDD'
+async function loadSuppliers() {
+  try {
+    const txt = await fsp.readFile(SUPPLIERS_FILE, 'utf8');
+    const arr = JSON.parse(txt);
+    if (!Array.isArray(arr)) throw new Error('suppliers.json must be a JSON array of strings');
+    const cleaned = Array.from(new Set(arr.map(s => (typeof s === 'string' ? s.trim() : '')).filter(Boolean)));
+    if (!cleaned.length) throw new Error('suppliers.json list is empty');
+    return cleaned;
+  } catch (err) {
+    console.error('Failed to read suppliers.json:', err?.message || err);
+    // Fallback: at least OHC
+    return ['OHC'];
   }
-];
-
-/* =========================
-   Microsoft Graph (Excel)
-========================= */
-async function getGraphToken() {
-  const url = `https://login.microsoftonline.com/${encodeURIComponent(MS_TENANT_ID)}/oauth2/v2.0/token`;
-  const body = new URLSearchParams({
-    client_id: MS_CLIENT_ID,
-    client_secret: MS_CLIENT_SECRET,
-    grant_type: 'client_credentials',
-    scope: 'https://graph.microsoft.com/.default'
-  });
-  const res = await fetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body
-  });
-  if (!res.ok) {
-    const t = await res.text().catch(() => '');
-    throw new Error(`Graph token failed: ${res.status} ${res.statusText} - ${t}`);
-  }
-  const json = await res.json();
-  return json.access_token;
-}
-
-// Convert a sharing URL to a driveItem id via /shares/{encoded}/driveItem
-function encodeSharingUrl(u) {
-  // base64url of "u!<url>"
-  const raw = 'u!' + u;
-  const b64 = Buffer.from(raw, 'utf8').toString('base64')
-    .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
-  return b64;
-}
-
-async function getDriveItemIdFromShare(shareUrl, token) {
-  const encoded = encodeSharingUrl(shareUrl);
-  const res = await fetch(`https://graph.microsoft.com/v1.0/shares/${encoded}/driveItem`, {
-    headers: { Authorization: `Bearer ${token}` }
-  });
-  if (!res.ok) {
-    const t = await res.text().catch(() => '');
-    throw new Error(`Graph share lookup failed: ${res.status} ${res.statusText} - ${t}`);
-  }
-  const json = await res.json();
-  return json?.id;
-}
-
-// Read entire used range values for a worksheet (valuesOnly)
-async function readWorksheetValues(driveItemId, sheetName, token) {
-  const url = `https://graph.microsoft.com/v1.0/me/drive/items/${encodeURIComponent(driveItemId)}/workbook/worksheets('${encodeURIComponent(sheetName)}')/usedRange(valuesOnly=true)?$select=values`;
-  const res = await fetch(url, {
-    headers: { Authorization: `Bearer ${token}` }
-  });
-  if (!res.ok) {
-    const t = await res.text().catch(() => '');
-    throw new Error(`Graph usedRange failed: ${res.status} ${res.statusText} - ${t}`);
-  }
-  const json = await res.json();
-  return json?.values || [];
-}
-
-// Helper to extract column index from letter (A=0)
-function colLetterToIndex(letter) {
-  const up = letter.trim().toUpperCase();
-  return up.charCodeAt(0) - 'A'.charCodeAt(0);
 }
 
 /* =========================
    Shopify Helpers
 ========================= */
 const SHOPIFY_BASE = `https://${SHOPIFY_DOMAIN}/admin/api/${SHOPIFY_API_VERSION}`;
-
 let __gate = Promise.resolve();
-const __GAP_MS = 400;
-async function __withThrottle(fn) {
+const __MIN_GAP_MS = 400; // polite global throttle
+
+async function withThrottle(fn) {
   const prev = __gate;
   let release;
   __gate = new Promise(res => { release = res; });
@@ -183,115 +91,153 @@ async function __withThrottle(fn) {
   try {
     return await fn();
   } finally {
-    setTimeout(release, __GAP_MS);
+    setTimeout(release, __MIN_GAP_MS);
   }
 }
 
 async function shopifyFetch(pathname, { method = 'GET', headers = {}, body } = {}, attempt = 1) {
   const url = `${SHOPIFY_BASE}${pathname}`;
-  const res = await __withThrottle(() => fetch(url, {
-    method,
-    headers: {
-      'X-Shopify-Access-Token': SHOPIFY_ADMIN_TOKEN,
-      'Content-Type': 'application/json',
-      ...headers
-    },
-    body: body ? JSON.stringify(body) : undefined
-  }));
+  const res = await withThrottle(() =>
+    fetch(url, {
+      method,
+      headers: {
+        'X-Shopify-Access-Token': SHOPIFY_ADMIN_TOKEN,
+        'Content-Type': 'application/json',
+        ...headers
+      },
+      body: body ? JSON.stringify(body) : undefined
+    })
+  );
 
   if (res.status === 429 || (res.status >= 500 && res.status < 600)) {
     const retryAfterHeader = res.headers.get('Retry-After');
     const retryAfter = retryAfterHeader ? parseFloat(retryAfterHeader) * 1000 : Math.min(2000 * attempt, 10000);
     if (attempt <= 5) {
-      console.warn(`Shopify ${res.status}. Retrying in ${retryAfter}ms (attempt ${attempt})...`);
+      console.warn(`Shopify ${res.status} on ${pathname}. Retrying in ${retryAfter}ms (attempt ${attempt})`);
       await new Promise(r => setTimeout(r, retryAfter));
       return shopifyFetch(pathname, { method, headers, body }, attempt + 1);
     }
   }
 
   if (!res.ok) {
-    const t = await res.text().catch(() => '');
-    throw new Error(`Shopify ${method} ${pathname} failed: ${res.status} ${res.statusText} - ${t}`);
+    const text = await res.text().catch(() => '');
+    throw new Error(`Shopify ${method} ${pathname} failed: ${res.status} ${res.statusText} - ${text}`);
   }
-  return res.json();
+  const ct = res.headers.get('content-type') || '';
+  if (ct.includes('application/json')) return res.json();
+  return res.text();
 }
 
+// Find by exact "name" e.g. "C#1234"
 async function findOrderByName(orderName) {
-  const encoded = encodeURIComponent(orderName);
-  const data = await shopifyFetch(`/orders.json?name=${encoded}&status=any`);
-  const order = (data.orders || []).find(o => o?.name === orderName);
-  if (!order) throw new Error(`Order not found: ${orderName}`);
+  const enc = encodeURIComponent(orderName);
+  const data = await shopifyFetch(`/orders.json?name=${enc}&status=any`);
+  const order = (data.orders || []).find(o => o.name === orderName);
+  if (!order) throw new Error(`Order ${orderName} not found`);
   return order;
-}
-
-async function upsertOrderMetafield(orderId, namespace, key, value, typeHint) {
-  const list = await shopifyFetch(`/orders/${orderId}/metafields.json`);
-  const existing = (list.metafields || []).find(m => m.namespace === namespace && m.key === key);
-  if (existing) {
-    await shopifyFetch(`/metafields/${existing.id}.json`, {
-      method: 'PUT',
-      body: { metafield: { id: existing.id, value } }
-    });
-  } else {
-    await shopifyFetch(`/orders/${orderId}/metafields.json`, {
-      method: 'POST',
-      body: {
-        metafield: {
-          namespace,
-          key,
-          type: typeHint || 'single_line_text_field',
-          value
-        }
-      }
-    });
-  }
 }
 
 async function fetchOrderMetafields(orderId) {
   const data = await shopifyFetch(`/orders/${orderId}/metafields.json`);
-  const map = {};
-  for (const mf of (data.metafields || [])) {
-    const ns = (mf.namespace || '').trim();
-    const key = (mf.key || '').trim();
-    const val = (mf.value ?? '').toString().trim();
-    if (ns && key) map[`${ns}.${key}`] = val;
+  const out = {};
+  for (const m of (data.metafields || [])) {
+    const ns = (m.namespace || '').trim();
+    const key = (m.key || '').trim();
+    const val = (m.value ?? '').toString().trim();
+    if (ns && key) out[`${ns}.${key}`] = { id: m.id, value: val };
   }
-  return map;
+  return out;
 }
 
-async function fetchOrderNote(orderId) {
-  const data = await shopifyFetch(`/orders/${orderId}.json?fields=note`);
-  return data?.order?.note || '';
+// Update an existing metafield (by id)
+async function updateMetafieldById(id, value) {
+  return shopifyFetch(`/metafields/${id}.json`, {
+    method: 'PUT',
+    body: { metafield: { id, value } }
+  });
+}
+
+// Create a new order metafield
+async function createOrderMetafield(orderId, namespace, key, value, typeHint = 'single_line_text_field') {
+  return shopifyFetch(`/orders/${orderId}/metafields.json`, {
+    method: 'POST',
+    body: { metafield: { namespace, key, type: typeHint, value } }
+  });
+}
+
+async function upsertOrderMetafield(orderId, namespace, key, value, typeHint) {
+  const all = await fetchOrderMetafields(orderId);
+  const existing = all[`${namespace}.${key}`];
+  if (!existing) {
+    return createOrderMetafield(orderId, namespace, key, value, typeHint);
+  }
+  if (existing.value === value) return { ok: true, unchanged: true };
+  return updateMetafieldById(existing.id, value);
+}
+
+async function fetchOrderCore(orderId) {
+  // Get note and created_at in one call
+  const data = await shopifyFetch(`/orders/${orderId}.json?fields=note,created_at`);
+  return data?.order || {};
 }
 
 async function updateOrderNote(orderId, note) {
-  await shopifyFetch(`/orders/${orderId}.json`, {
+  return shopifyFetch(`/orders/${orderId}.json`, {
     method: 'PUT',
     body: { order: { id: orderId, note } }
   });
 }
 
 /* =========================
-   Arrange Logic
+   _nc_arranged_with logic
+   - Future-proof for multiple suppliers (A & B & C ...)
+   - Try candidate strings until Shopify accepts; else throw
 ========================= */
-// Given current value like "", "OHC", or "OHC & Bospeed", add a supplier
-// and return the FINAL STRING we will attempt to set.
-// If value already includes supplier, returns current unchanged.
-function computeArrangedWith(current, supplier) {
-  const cur = (current || '').trim();
-  if (!cur) return supplier;
-  // Normalize by splitting on "&"
-  const parts = cur.split('&').map(s => s.trim()).filter(Boolean);
-  if (parts.includes(supplier)) return cur;
+function parseSuppliersFromValue(val) {
+  const s = (val || '').trim();
+  if (!s) return [];
+  return s.split('&').map(x => x.trim()).filter(Boolean);
+}
 
-  // Create a new set and build a normalized candidate string sorted A..Z
-  const set = new Set(parts.concat([supplier]));
-  const combined = Array.from(set).sort((a, b) => a.localeCompare(b)).join(' & ');
-  return combined;
+function uniqPreserve(arr) {
+  const seen = new Set();
+  const out = [];
+  for (const v of arr) {
+    if (!seen.has(v)) { seen.add(v); out.push(v); }
+  }
+  return out;
+}
+
+// generate candidate strings to try (ordered by most natural)
+function* generateCombinationCandidates(existingList, newSupplier) {
+  const base = uniqPreserve([...existingList, newSupplier]);
+
+  // 1) Keep existing order, append newSupplier at the end (if it wasn't there)
+  yield base.join(' & ');
+
+  // 2) Alphabetical order
+  const alpha = [...base].sort((a, b) => a.localeCompare(b));
+  yield alpha.join(' & ');
+
+  // 3) If there are only 2-3 suppliers, try all permutations
+  if (base.length <= 3) {
+    const permute = (arr) => {
+      if (arr.length <= 1) return [arr];
+      const out = [];
+      for (let i = 0; i < arr.length; i++) {
+        const rest = arr.slice(0, i).concat(arr.slice(i + 1));
+        for (const tail of permute(rest)) out.push([arr[i], ...tail]);
+      }
+      return out;
+    };
+    for (const p of permute(base)) {
+      yield p.join(' & ');
+    }
+  }
 }
 
 /* =========================
-   Slack App
+   Slack App (Socket Mode)
 ========================= */
 const app = new App({
   token: SLACK_BOT_TOKEN,
@@ -301,205 +247,286 @@ const app = new App({
   processBeforeResponse: true
 });
 
-app.error((err) => {
-  console.error('⚠️ Bolt error:', err?.stack || err?.message || err);
-});
-
-app.command('/ping', async ({ ack, respond }) => {
-  await ack();
-  await respond({ text: 'pong' });
+app.error((e) => {
+  console.error('⚠️ Bolt error:', e?.stack || e?.message || e);
 });
 
 /* =========================
-   Posting & Actions
+   /ping -> pong
 ========================= */
-function buildMessageBlocks({ docKey, docName, supplier, orderName, orderDate }) {
-  const textLines = [
-    `*New order detected* in _${docName}_`,
-    `• *Supplier:* ${supplier}`,
-    `• *Order #:* ${orderName}`,
-    orderDate ? `• *Order Date:* ${orderDate}` : null
-  ].filter(Boolean);
+app.command('/ping', async ({ ack, respond, command }) => {
+  await ack();
+  const where = command?.channel_id ? `<#${command.channel_id}>` : 'here';
+  await respond({ text: `pong (${where})` });
+});
 
-  return [
-    {
-      type: 'section',
-      text: { type: 'mrkdwn', text: textLines.join('\n') }
-    },
-    {
-      type: 'actions',
-      elements: [
-        {
-          type: 'button',
-          action_id: 'arrange_order',
-          text: { type: 'plain_text', text: 'Arrange' },
-          style: 'primary',
-          value: JSON.stringify({ docKey, supplier, orderName, orderDate })
+/* =========================
+   /arrange -> open modal with 5 sets
+========================= */
+app.command('/arrange', async ({ ack, body, client, logger }) => {
+  await ack();
+  try {
+    const suppliers = await loadSuppliers();
+    const defaultSupplier = suppliers.includes('OHC') ? 'OHC' : suppliers[0];
+    const supplierOptions = suppliers.slice(0, 100).map(s => ({
+      text: { type: 'plain_text', text: s },
+      value: s
+    }));
+
+    const makeSet = (idx) => ([
+      {
+        type: 'input',
+        block_id: `order_block_${idx}`,
+        label: { type: 'plain_text', text: `#${idx} — Order # (must start with C#)` },
+        element: {
+          type: 'plain_text_input',
+          action_id: `order_input_${idx}`,
+          placeholder: { type: 'plain_text', text: 'e.g., C#5723' }
         },
-        {
-          type: 'button',
-          action_id: 'ignore_order',
-          text: { type: 'plain_text', text: 'Ignore' },
-          value: JSON.stringify({ docKey, supplier, orderName, orderDate })
-        }
-      ]
+        optional: true
+      },
+      {
+        type: 'input',
+        block_id: `supplier_block_${idx}`,
+        label: { type: 'plain_text', text: `#${idx} — Supplier` },
+        element: {
+          type: 'static_select',
+          action_id: `supplier_select_${idx}`,
+          initial_option: { text: { type: 'plain_text', text: defaultSupplier }, value: defaultSupplier },
+          options: supplierOptions
+        },
+        optional: false
+      },
+      { type: 'divider' }
+    ]);
+
+    const blocks = [
+      { type: 'header', text: { type: 'plain_text', text: 'Arrange Orders' } },
+      { type: 'section', text: { type: 'mrkdwn', text: 'Fill any of the sets below. Only sets with an Order # will be processed.' } },
+      { type: 'divider' },
+      ...makeSet(1),
+      ...makeSet(2),
+      ...makeSet(3),
+      ...makeSet(4),
+      ...makeSet(5)
+    ];
+
+    await client.views.open({
+      trigger_id: body.trigger_id,
+      view: {
+        type: 'modal',
+        callback_id: 'arrange_modal_submit',
+        private_metadata: JSON.stringify({ channel: body.channel_id || WATCH_CHANNEL_ID || '' }),
+        title: { type: 'plain_text', text: 'Arrange' },
+        submit: { type: 'plain_text', text: 'Apply' },
+        close: { type: 'plain_text', text: 'Cancel' },
+        blocks
+      }
+    });
+  } catch (e) {
+    logger.error(e);
+  }
+});
+
+/* =========================
+   Modal submission handler
+========================= */
+app.view('arrange_modal_submit', async ({ ack, body, view, client, logger }) => {
+  // Build list of entries
+  const state = view.state.values || {};
+  const entries = [];
+  for (let i = 1; i <= 5; i++) {
+    const orderVal = state?.[`order_block_${i}`]?.[`order_input_${i}`]?.value?.trim() || '';
+    const supplierVal = state?.[`supplier_block_${i}`]?.[`supplier_select_${i}`]?.selected_option?.value || '';
+    if (orderVal) entries.push({ idx: i, order: orderVal, supplier: supplierVal });
+  }
+
+  // Validation
+  const errors = {};
+  const orderSet = new Set();
+  const suppliers = await loadSuppliers();
+
+  for (const e of entries) {
+    // order number must start with C#
+    if (!/^C#\d{1,6}$/i.test(e.order)) {
+      errors[`order_block_${e.idx}`] = 'Order # must start with "C#" followed by digits (e.g., C#1234).';
     }
-  ];
+    // supplier must be in list
+    if (!suppliers.includes(e.supplier)) {
+      errors[`supplier_block_${e.idx}`] = `Supplier must be one of: ${suppliers.join(', ')}`;
+    }
+    // no duplicates
+    const key = `${e.order}`;
+    if (orderSet.has(key)) {
+      errors[`order_block_${e.idx}`] = 'Duplicate order in this submission.';
+    } else {
+      orderSet.add(key);
+    }
+  }
+
+  if (Object.keys(errors).length) {
+    await ack({ response_action: 'errors', errors });
+    return;
+  }
+
+  await ack();
+
+  const md = JSON.parse(view.private_metadata || '{}');
+  const channel = md.channel || WATCH_CHANNEL_ID || body?.user?.id;
+
+  // Post a parent message summarizing intent
+  let parent;
+  try {
+    parent = await client.chat.postMessage({
+      channel,
+      text: `Arranging ${entries.length} order(s)…`
+    });
+  } catch (e) {
+    logger.error('post parent failed:', e);
+  }
+  const thread_ts = parent?.ts;
+
+  // Process entries sequentially to be gentle on Shopify
+  const results = [];
+  for (const e of entries) {
+    try {
+      const res = await arrangeOne(e.order, e.supplier);
+      results.push({ ...e, ok: true, info: res });
+      if (thread_ts) {
+        await client.chat.postMessage({
+          channel,
+          thread_ts,
+          text: `✅ ${e.order} arranged with ${e.supplier}`
+        });
+      }
+    } catch (err) {
+      results.push({ ...e, ok: false, error: err?.message || String(err) });
+      if (thread_ts) {
+        await client.chat.postMessage({
+          channel,
+          thread_ts,
+          text: `❌ ${e.order} failed: ${err?.message || String(err)}`
+        });
+      }
+    }
+  }
+
+  // Persist run log
+  try {
+    await ensureDataDir();
+    const log = (await readJsonSafe(RUN_LOG, [])) || [];
+    log.push({
+      at: new Date().toISOString(),
+      user: body?.user?.id || 'unknown',
+      count: entries.length,
+      results
+    });
+    while (log.length > 200) log.shift();
+    await writeJsonAtomic(RUN_LOG, log);
+  } catch (e) {
+    logger.error('persist log failed:', e);
+  }
+
+  // Final summary
+  try {
+    const ok = results.filter(r => r.ok).map(r => r.order);
+    const bad = results.filter(r => !r.ok).map(r => `${r.order} (${r.error})`);
+    const lines = [];
+    if (ok.length) lines.push(`✅ Done: ${ok.join(', ')}`);
+    if (bad.length) lines.push(`❌ Failed: ${bad.join(', ')}`);
+    await client.chat.postMessage({
+      channel,
+      thread_ts,
+      text: lines.join('\n') || 'Done.'
+    });
+  } catch (e) {
+    logger.error('post summary failed:', e);
+  }
+});
+
+/* =========================
+   Core worker for one order
+========================= */
+function formatMDY(d) {
+  const dt = new Date(d);
+  const mm = String(dt.getMonth() + 1).padStart(2, '0');
+  const dd = String(dt.getDate()).padStart(2, '0');
+  const yyyy = String(dt.getFullYear());
+  return `${mm}/${dd}/${yyyy}`;
 }
 
-app.action('ignore_order', async ({ ack, body, client }) => {
-  await ack();
-  try {
-    const payload = JSON.parse(body.actions?.[0]?.value || '{}');
-    const channel = body.channel?.id || WATCH_CHANNEL_ID;
-    const thread_ts = body.message?.ts;
-    await client.chat.postMessage({
-      channel,
-      thread_ts,
-      text: `Ignored ${payload.orderName} for ${payload.supplier}.`
-    });
-  } catch (e) {
-    console.error('ignore_order failed:', e);
+async function arrangeOne(orderName, supplierToAdd) {
+  // 1) Lookup order
+  const order = await findOrderByName(orderName);
+  const orderId = order.id;
+
+  // 2) arrange_status -> ensure "Arranged"
+  const mfsBefore = await fetchOrderMetafields(orderId);
+  const arrangeMf = mfsBefore['custom.arrange_status'];
+  const currentArrange = arrangeMf?.value || '';
+  if (currentArrange !== 'Arranged') {
+    await upsertOrderMetafield(orderId, 'custom', 'arrange_status', 'Arranged', 'single_line_text_field');
   }
-});
 
-app.action('arrange_order', async ({ ack, body, client }) => {
-  await ack();
-  try {
-    const payload = JSON.parse(body.actions?.[0]?.value || '{}');
-    const { supplier, orderName, orderDate } = payload;
-    const channel = body.channel?.id || WATCH_CHANNEL_ID;
-    const thread_ts = body.message?.ts;
+  // 3) _nc_arranged_with -> add supplier by trying allowed strings
+  const currentWith = (mfsBefore['custom._nc_arranged_with']?.value || '').trim();
+  const list = parseSuppliersFromValue(currentWith);
+  if (!list.includes(supplierToAdd)) {
+    const candidates = generateCombinationCandidates(list, supplierToAdd);
+    let success = false;
+    const existing = mfsBefore['custom._nc_arranged_with'];
+    let lastErr = null;
 
-    // 1) Find Shopify order
-    const order = await findOrderByName(orderName);
-    const orderId = order.id;
-
-    // 2) Metafields
-    const mf = await fetchOrderMetafields(orderId);
-
-    // 2a) If arrange_status !== "Arranged", set to "Arranged"
-    if ((mf['custom.arrange_status'] || '').trim() !== 'Arranged') {
-      await upsertOrderMetafield(orderId, 'custom', 'arrange_status', 'Arranged');
-    }
-
-    // 3) Compute new custom._nc_arranged_with by "adding" supplier
-    const current = (mf['custom._nc_arranged_with'] || '').trim();
-    const nextValue = computeArrangedWith(current, supplier);
-
-    // Attempt to set. If Shopify rejects (enum not allowed), throw helpful error.
-    try {
-      await upsertOrderMetafield(orderId, 'custom', '_nc_arranged_with', nextValue);
-    } catch (err) {
-      const msg = `Cannot set custom._nc_arranged_with="${nextValue}". Add this exact value to the allowed list in Shopify Admin, then retry.`;
-      throw new Error(msg);
-    }
-
-    // 4) Prepend order note line
-    const existingNote = await fetchOrderNote(orderId);
-    const now = new Date();
-    const mm = String(now.getMonth() + 1).padStart(2, '0');
-    const dd = String(now.getDate()).padStart(2, '0');
-    const yyyy = String(now.getFullYear());
-    const headerLine = `Update ${mm}/${dd}/${yyyy}: Arranged with ${supplier}${orderDate ? ` on ${orderDate}` : ''}`;
-    const dashLine = '————————————';
-    const newNote = `${headerLine}\n${dashLine}\n${existingNote || ''}`;
-    await updateOrderNote(orderId, newNote);
-
-    await client.chat.postMessage({
-      channel,
-      thread_ts,
-      text: `✅ Arranged ${orderName} with ${supplier}. Metafields and order note updated.`
-    });
-  } catch (e) {
-    console.error('arrange_order failed:', e);
-    const channel = body.channel?.id || WATCH_CHANNEL_ID;
-    const thread_ts = body.message?.ts;
-    if (channel) {
-      await app.client.chat.postMessage({
-        channel,
-        thread_ts,
-        text: `❌ Arrange failed: ${e?.message || e}`
-      }).catch(() => {});
-    }
-  }
-});
-
-/* =========================
-   Scanner (polling)
-========================= */
-async function scanOnceAndNotify() {
-  const token = await getGraphToken();
-
-  for (const cfg of SUPPLIER_DOCS) {
-    const { key, name, shareUrl, sheet, colOrder, colDate, supplier } = cfg;
-    const seenFile = path.join(SEEN_DIR, `${key}.json`);
-    const seen = new Set(await readJsonSafe(seenFile, []));
-
-    let driveItemId;
-    try {
-      driveItemId = await getDriveItemIdFromShare(shareUrl, token);
-    } catch (e) {
-      console.error(`[${key}] driveItemId error:`, e?.message || e);
-      continue;
-    }
-
-    let values;
-    try {
-      values = await readWorksheetValues(driveItemId, sheet, token);
-    } catch (e) {
-      console.error(`[${key}] readWorksheetValues error:`, e?.message || e);
-      continue;
-    }
-
-    const colOrderIdx = colLetterToIndex(colOrder);
-    const colDateIdx = colLetterToIndex(colDate);
-
-    const channel = WATCH_CHANNEL_ID;
-    if (!channel) {
-      console.error('WATCH_CHANNEL_ID is not set; cannot post notifications.');
-      return;
-    }
-
-    // Walk rows, find new orders like C#XXXX (4+ digits) in the order column
-    for (let r = 0; r < values.length; r++) {
-      const row = values[r] || [];
-      const orderCell = (row[colOrderIdx] ?? '').toString().trim();
-      if (!/^C#\d{4,}$/.test(orderCell)) continue;
-
-      if (seen.has(orderCell)) continue; // already notified
-
-      const orderDate = (row[colDateIdx] ?? '').toString().trim();
-      const blocks = buildMessageBlocks({
-        docKey: key,
-        docName: name,
-        supplier,
-        orderName: orderCell,
-        orderDate
-      });
-
+    for (const candidate of candidates) {
       try {
-        await app.client.chat.postMessage({
-          channel,
-          text: `New order ${orderCell} detected in ${name}`,
-          blocks
-        });
-        seen.add(orderCell);
+        if (existing?.id) {
+          await updateMetafieldById(existing.id, candidate);
+        } else {
+          await createOrderMetafield(orderId, 'custom', '_nc_arranged_with', candidate, 'single_line_text_field');
+        }
+        success = true;
+        break;
       } catch (e) {
-        console.error(`[${key}] Slack post failed for ${orderCell}:`, e?.message || e);
+        // Shopify will 422 if candidate is not in allowed list
+        lastErr = e;
       }
     }
 
-    // persist seen set
-    await writeJsonAtomic(seenFile, Array.from(seen));
+    if (!success) {
+      const tried = [];
+      const again = generateCombinationCandidates(list, supplierToAdd);
+      for (const c of again) tried.push(c);
+      throw new Error(
+        `No allowed value found for custom._nc_arranged_with to include: ${[...list, supplierToAdd].join(' & ')}. ` +
+        `Tried: ${tried.join(' | ')}. Add the required combination to the metafield definition in Shopify Admin and retry.`
+      );
+    }
   }
+
+  // 4) Prepend order note
+  const core = await fetchOrderCore(orderId);
+  const existingNote = core?.note || '';
+  const orderCreated = core?.created_at || order?.created_at || new Date().toISOString();
+
+  const todayStr = formatMDY(new Date());
+  const orderDateStr = formatMDY(orderCreated);
+
+  const headerLine = `Update ${todayStr}: Arranged with ${supplierToAdd} on ${orderDateStr}`;
+  const dashLine = '————————————';
+  const newNote = `${headerLine}\n${dashLine}\n${existingNote || ''}`;
+
+  await updateOrderNote(orderId, newNote);
+
+  return { orderId, orderName, supplier: supplierToAdd };
 }
 
 /* =========================
-   Start
+   Start app
 ========================= */
 (async () => {
-  // Lightweight connectivity checks (non-fatal)
+  await ensureDataDir();
+
+  // Light connectivity checks (non-fatal)
   try {
     await shopifyFetch('/shop.json');
     console.log('[shopify] connectivity ok');
@@ -507,27 +534,10 @@ async function scanOnceAndNotify() {
     console.error('⚠️ Shopify check failed:', e?.message || e);
   }
 
-  try {
-    await app.start();
-    console.log('[slack] app started (Socket Mode)');
-  } catch (e) {
-    console.error('Slack start failed:', e?.message || e);
-    process.exit(1);
-  }
+  await app.start();
+  console.log('[slack] app started (Socket Mode)');
 
-  // Initial scan immediately, then interval
-  try {
-    await scanOnceAndNotify();
-  } catch (e) {
-    console.error('Initial scan failed:', e?.message || e);
+  if (WATCH_CHANNEL_ID) {
+    console.log(`[info] default channel set: ${WATCH_CHANNEL_ID}`);
   }
-
-  const intervalMs = Math.max(15000, Number(SCAN_INTERVAL_MS) || 60000);
-  setInterval(async () => {
-    try {
-      await scanOnceAndNotify();
-    } catch (e) {
-      console.error('Periodic scan failed:', e?.message || e);
-    }
-  }, intervalMs);
 })();

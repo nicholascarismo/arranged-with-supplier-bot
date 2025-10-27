@@ -1,7 +1,7 @@
 {
   "name": "arranged-with-supplier-bot",
   "version": "1.0.0",
-  "description": "Slack Socket Mode bot that watches 3 Microsoft Excel Live docs for new orders and arranges Shopify orders with the correct supplier.",
+  "description": "Slack Socket Mode bot to arrange Shopify orders with suppliers via modal, updating metafields and notes.",
   "type": "module",
   "main": "index.js",
   "engines": {
@@ -9,10 +9,10 @@
   },
   "scripts": {
     "start": "node index.js",
-    "dev": "NODE_ENV=development node index.js"
+    "start:dev": "NODE_ENV=development node index.js"
   },
   "dependencies": {
-    "@slack/bolt": "^3.18.0",
+    "@slack/bolt": "^3.17.1",
     "dotenv": "^16.4.5"
   }
 }
