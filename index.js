@@ -188,6 +188,22 @@ async function updateOrderNote(orderId, note) {
   });
 }
 
+// Read current tags as an array
+async function fetchOrderTags(orderId) {
+  const data = await shopifyFetch(`/orders/${orderId}.json?fields=tags`);
+  const raw = data?.order?.tags || '';
+  return raw.split(',').map(t => t.trim()).filter(Boolean);
+}
+
+// Replace full tag set for an order
+async function updateOrderTags(orderId, tagsArray) {
+  const tags = tagsArray.join(', ');
+  return shopifyFetch(`/orders/${orderId}.json`, {
+    method: 'PUT',
+    body: { order: { id: orderId, tags } }
+  });
+}
+
 /* =========================
    _nc_arranged_with logic
    - Future-proof for multiple suppliers (A & B & C ...)
@@ -516,6 +532,21 @@ async function arrangeOne(orderName, supplierToAdd) {
   const newNote = `${headerLine}\n${dashLine}\n${existingNote || ''}`;
 
   await updateOrderNote(orderId, newNote);
+
+// 5) Tags: remove ArrangeStatus_NeedToArrange, add ArrangeStatus_Arranged
+try {
+  const current = await fetchOrderTags(orderId);
+  const next = current.filter(t => t !== 'ArrangeStatus_NeedToArrange');
+  if (!next.includes('ArrangeStatus_Arranged')) next.push('ArrangeStatus_Arranged');
+  // Only write if changed
+  const changed = next.length !== current.length || next.some((t, i) => t !== current[i]);
+  if (changed) {
+    await updateOrderTags(orderId, next);
+  }
+} catch (e) {
+  // Non-fatal: log but do not fail the arrange flow
+  console.error(`⚠️ Tag update failed for ${orderName} (${orderId}):`, e?.message || e);
+}
 
   return { orderId, orderName, supplier: supplierToAdd };
 }
