@@ -686,7 +686,7 @@ async function reserveIncomingOne({ orderName, invNumber, supplier, invoiced, in
   await upsertOrderMetafield(orderId, 'custom', '_nc_reserve_incoming', 'RESERVED INCOMING INVENTORY', 'single_line_text_field');
 
   // 4) custom.reserved_inv_number_s_ -> invNumber
-  await upsertOrderMetafield(orderId, 'custom', 'reserved_inv_number_s_', invNumber, 'single_line_text_field');
+  await upsertOrderMetafield(orderId, 'custom', 'reserved_inv_number_s_', invNumber, 'multi_line_text_field');
 
   // 5) custom.arrange_status -> ensure "Arranged" (do nothing if already "Arranged")
   const currentArrange = (mfsBefore['custom.arrange_status']?.value || '').trim();
