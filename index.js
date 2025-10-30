@@ -341,7 +341,7 @@ app.command('/res-inv', async ({ ack, body, client, logger }) => {
         type: 'modal',
         callback_id: 'res_inv_modal_submit',
         private_metadata: JSON.stringify({ channel: body.channel_id || WATCH_CHANNEL_ID || '' }),
-        title: { type: 'plain_text', text: 'Reserve Arranged Inventory' },
+        title: { type: 'plain_text', text: 'Reserve Arranged Inv' },
         submit: { type: 'plain_text', text: 'Apply' },
         close: { type: 'plain_text', text: 'Cancel' },
         blocks: [
